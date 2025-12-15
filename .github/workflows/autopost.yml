@@ -17,8 +17,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install requests
+- name: Install dependencies
+  run: pip install requests openai
+
 
       - name: Run autopost script
         run: python autopost.py
