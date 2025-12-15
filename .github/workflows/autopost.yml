@@ -1,0 +1,30 @@
+name: WordPress Auto Post
+
+on:
+  schedule:
+    - cron: "5 16 * * *"  # 9:05 AM America/Denver during standard time (winter)
+  workflow_dispatch:
+
+jobs:
+  run-autopost:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run autopost script
+        run: python autopost.py
+        env:
+          WPCOM_CLIENT_ID: ${{ secrets.WPCOM_CLIENT_ID }}
+          WPCOM_CLIENT_SECRET: ${{ secrets.WPCOM_CLIENT_SECRET }}
+          WPCOM_USERNAME: ${{ secrets.WPCOM_USERNAME }}
+          WPCOM_APP_PASSWORD: ${{ secrets.WPCOM_APP_PASSWORD }}
+          WPCOM_SITE_ID: ${{ secrets.WPCOM_SITE_ID }}
