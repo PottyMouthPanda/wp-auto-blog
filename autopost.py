@@ -99,63 +99,172 @@ def already_scheduled(token: str, target_day: date) -> bool:
 def rotating_cta_style(publish_dt: datetime) -> str:
     # 0 soft, 1 direct, 2 soft... deterministic rotation without saving state
     return ["soft", "direct", "soft", "direct"][publish_dt.weekday() % 4]
+def friday_rotation_type(publish_dt):
+    """
+    Rotates Fuck It Friday types:
+    Week 1 = A (Low-Effort Dinner Wins)
+    Week 2 = B (Parenting Permission Slips)
+    Week 3 = C (Hot Takes)
+    """
+    week_number = publish_dt.isocalendar()[1]
+    return ["A", "B", "C"][(week_number - 1) % 3]
 
-def build_prompt(theme: dict, publish_dt: datetime) -> str:
+def build_prompt(theme, publish_dt):
+    weekday = publish_dt.weekday()
     cta_style = rotating_cta_style(publish_dt)
-    stan_line = STAN_URL if STAN_URL else "[YOUR STAN STORE LINK]"
+    stan_link = STAN_URL if STAN_URL else "[STAN STORE LINK]"
 
-    return f"""
-You are writing a WordPress blog post in the creator voice: PottyMouthPanda.
+    base_voice = """
+VOICE RULES:
+- Profanity is normal and on-brand (fuck, shit, ass allowed)
+- Do NOT swear every sentence
+- Conversational, honest, slightly unhinged
+- No corporate tone
+- No therapy-speak
+- No alcohol references
+- No inspirational poster bullshit
+- No repeating frameworks unless explicitly told
+"""
 
-VOICE & TONE (VERY IMPORTANT):
-- Profanity is EXPECTED and NORMAL here.
-- Use casual swearing naturally (fuck, shit, damn, hell) as emphasis and rhythm.
-- Do NOT censor yourself unnecessarily.
-- Do NOT swear every single sentence, but absolutely more than “once or twice.”
-- This should sound like a tired, funny, blunt mom venting to her people — not a brand-safe influencer.
-- Humor > polish. Honesty > inspiration.
-- No sexual content. No hate speech. No alcohol/wine references. Occasional marijuana usage references acceptable.
+    if weekday == 0:
+        prompt = f"""
+Write a Mom Chaos Monday blog post in the PottyMouthPanda voice.
 
-STYLE RULES:
-- Conversational, slightly unhinged, but still helpful.
-- Short paragraphs. White space matters.
-- Clear headers (H2).
-- Bullet lists where appropriate.
-- Avoid corporate phrases, therapy-speak, or fake positivity.
-- NEVER say “as an AI” or mention being a model.
+{base_voice}
 
-STRUCTURE (do not skip):
-1) Scroll-stopping hook (1–2 punchy paragraphs)
-2) Relatable chaos / real-life context
-3) Practical advice or framework (actual usable steps)
-4) “If you’re drowning, start here” quick list
-5) CTA that matches the requested style
+POST RULES:
+- Focus on ONE specific, real parenting moment
+- Mental load, burnout, schedules, chaos
+- NO recipes
+- NO meal plans
+- Include ONE practical takeaway or mindset shift at the end
+
+STRUCTURE:
+1. Short real-life story
+2. Why it was frustrating or overwhelming
+3. One realistic tip or reframe
+4. Gentle close
+
+CTA:
+- Optional
+- One sentence max
+- Soft mention only
 
 LENGTH:
-- 900–1200 words
+700–1000 words
 
-POST DETAILS:
-- Series: {theme["label"]}
-- Angle: {theme["angle"]}
-- Publish date: {publish_dt.strftime("%A, %B %d, %Y")}
-
-CTA DETAILS:
-- Focus: meal plans + Stan Store
-- Style: {cta_style}
-- Include this link at least once: {stan_line}
-
-CTA GUIDANCE:
-- Soft CTA = supportive, invitational (“If this helps, I’ve got… no pressure.”)
-- Direct CTA = blunt and efficient (“Here’s the shortcut. Grab the damn plan.”)
-
-OUTPUT FORMAT (STRICT):
-Return VALID JSON ONLY with these exact keys:
-- title (string)
-- excerpt (string, max 160 characters)
-- html (string, valid WordPress HTML)
-
-Do not include explanations. Do not include markdown. Do not include anything outside JSON.
+GOAL:
+Make the reader feel less alone.
 """
+
+    elif weekday == 2:
+        prompt = f"""
+Write a WTF’s for Dinner Wednesday blog post in the PottyMouthPanda voice.
+
+{base_voice}
+
+POST RULES:
+- Feature ONE new family- and budget-friendly recipe
+- Weeknight realistic
+- FULL ingredients and instructions required
+- Include optional swaps for picky eaters or budget needs
+
+STRUCTURE:
+1. Why this recipe exists
+2. Ingredients list
+3. Step-by-step instructions
+4. Optional swaps or shortcuts
+5. Why this recipe works
+
+HARD RULES:
+- NO frameworks
+- NO weekly plans
+- NO long storytelling
+
+CTA:
+Soft CTA only (one sentence)
+
+LENGTH:
+600–900 words
+
+GOAL:
+Reader thinks “I could actually make this.”
+"""
+
+    elif weekday == 4:
+        fit_type = friday_rotation_type(publish_dt)
+
+        prompt = f"""
+Write a Fuck It Friday blog post in the PottyMouthPanda voice.
+
+{base_voice}
+
+THIS WEEK’S TYPE: {fit_type}
+
+TYPE RULES:
+A = Low-Effort Dinner Wins
+B = Parenting Permission Slips
+C = Hot Takes
+
+STRUCTURE:
+1. Strong opening opinion
+2. Normalize the shortcut or belief
+3. Reframe guilt or expectations
+4. Calm, relieving close
+
+CTA:
+Optional, never salesy
+
+LENGTH:
+700–1000 words
+
+GOAL:
+Make readers exhale.
+"""
+
+    elif weekday == 6:
+        prompt = f"""
+Write a Feed the Chaos Sunday Drop blog post in the PottyMouthPanda voice.
+
+{base_voice}
+
+POST RULES:
+- Weekly meal plan OVERVIEW ONLY
+- NO recipes
+- NO teaching
+- NO storytelling
+
+REQUIRED CONTENT:
+- 3 breakfast options
+- 2–3 lunch options
+- 1–2 rotating snack options
+- 6 dinners
+
+STRUCTURE:
+1. Short relief-focused opening
+2. Breakfast list
+3. Lunch list
+4. Snack list
+5. Dinner list
+6. Value explanation
+7. Direct CTA
+
+CTA:
+“This is the overview. The full plan lives inside Feed the Chaos.”
+Link: {stan_link}
+
+LENGTH:
+600–800 words
+
+GOAL:
+Make the paid plan feel obvious.
+"""
+
+    else:
+        raise ValueError("No prompt defined for this weekday")
+
+    return prompt
+
 
 def ai_generate_post(theme: dict, publish_dt: datetime) -> dict:
     client = OpenAI()
