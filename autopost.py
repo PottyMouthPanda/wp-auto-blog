@@ -1,238 +1,295 @@
 import os
 import json
-import requests
-from datetime import datetime, timedelta, date
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 
+import requests
 from openai import OpenAI
 
 # =========================
-# SETTINGS
+# CONFIG
 # =========================
-TIMEZONE = "America/Denver"
-POST_HOUR = 9
-POST_MINUTE = 0
 
-# Categories (must match WordPress EXACTLY)
-CATEGORY_PARENTING = "Parenting in the Wild"
-CATEGORY_WTFS = "WTFs for Dinner"
-CATEGORY_FUCKIT = "Fuck-It Fridays"
-CATEGORY_RECIPES = "Real-AF Recipes"
+TZ_NAME = os.getenv("BLOG_TIMEZONE", "America/Denver")
+TZ = ZoneInfo(TZ_NAME)
 
-STAN_URL = os.environ.get("STAN_STORE_URL", "").strip()
+WPCOM_CLIENT_ID = os.getenv("WPCOM_CLIENT_ID", "").strip()
+WPCOM_CLIENT_SECRET = os.getenv("WPCOM_CLIENT_SECRET", "").strip()
+WPCOM_USERNAME = os.getenv("WPCOM_USERNAME", "").strip()
+WPCOM_APP_PASSWORD = os.getenv("WPCOM_APP_PASSWORD", "").strip()
+WPCOM_SITE_ID = os.getenv("WPCOM_SITE_ID", "").strip()
 
-THEMES = {
-    0: {  # Monday
-        "label": "Mom Chaos Monday",
-        "category": CATEGORY_PARENTING,
-        "tags": ["Mom Chaos Monday", "parenting", "real life"],
-        "angle": "parenting chaos + how meal planning keeps the house from burning down",
-    },
-    2: {  # Wednesday
-        "label": "WTF’s for Dinner Wednesday",
-        "category": CATEGORY_WTFS,
-        "tags": ["WTFs for Dinner", "meal planning", "dinner ideas"],
-        "angle": "solve the 5pm panic with a practical dinner framework and a few go-to options",
-    },
-    4: {  # Friday
-        "label": "Fuck It Friday",
-        "category": CATEGORY_FUCKIT,
-        "tags": ["Fuck It Friday", "easy dinners", "hot mess"],
-        "angle": "lowest-effort food + permission slips + realistic shortcuts",
-    },
-    6: {  # Sunday
-        "label": "Feed the Chaos Sunday Drop",
-        "category": CATEGORY_RECIPES,
-        "tags": ["Feed the Chaos", "meal plans", "weekly drop"],
-        "angle": "new meal plan drop announcement: what’s inside, who it’s for, why it saves sanity",
-    },
-}
+STAN_URL = os.getenv("STAN_STORE_URL", "").strip()  # ex: https://stan.store/ThePottyMouthPanda
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")  # safe default
+
+# If your workflow runs at/near 9am local, publishing immediately is simplest.
+# If you want WP to schedule it a few minutes ahead, set:
+#   POST_MODE=future and FUTURE_MINUTES=5
+POST_MODE = os.getenv("POST_MODE", "publish").strip().lower()  # publish or future
+FUTURE_MINUTES = int(os.getenv("FUTURE_MINUTES", "5"))
+
+# Category mapping (your WP categories)
+CATEGORY_MOM_CHAOS = os.getenv("CAT_MOM_CHAOS", "Parenting in the Wild")
+CATEGORY_WTFS = os.getenv("CAT_WTFS", "WTFs for Dinner")
+CATEGORY_FIF = os.getenv("CAT_FIF", "Fuck-It Fridays")
+CATEGORY_SUNDAY = os.getenv("CAT_SUNDAY", "Hot Mess Hacks")  # you can change this if you create "Feed the Chaos"
 
 # =========================
-# WORDPRESS.COM AUTH
+# DATA STRUCTURES
 # =========================
-def get_wp_token() -> str:
-    r = requests.post(
-        "https://public-api.wordpress.com/oauth2/token",
-        data={
-            "client_id": os.environ["WPCOM_CLIENT_ID"],
-            "client_secret": os.environ["WPCOM_CLIENT_SECRET"],
-            "grant_type": "password",
-            "username": os.environ["WPCOM_USERNAME"],
-            "password": os.environ["WPCOM_APP_PASSWORD"],
-        },
-        timeout=30,
-    )
+
+@dataclass
+class GeneratedPost:
+    title: str
+    excerpt: str
+    html: str
+    category: str
+
+
+# =========================
+# WORDPRESS.COM AUTH + POST
+# =========================
+
+def wpcom_get_token() -> str:
+    """
+    WordPress.com OAuth2 token via password grant.
+    Uses WPCOM_USERNAME + WPCOM_APP_PASSWORD.
+    """
+    if not all([WPCOM_CLIENT_ID, WPCOM_CLIENT_SECRET, WPCOM_USERNAME, WPCOM_APP_PASSWORD]):
+        raise RuntimeError("Missing one or more WordPress.com env vars (client id/secret/username/app password).")
+
+    url = "https://public-api.wordpress.com/oauth2/token"
+    data = {
+        "client_id": WPCOM_CLIENT_ID,
+        "client_secret": WPCOM_CLIENT_SECRET,
+        "grant_type": "password",
+        "username": WPCOM_USERNAME,
+        "password": WPCOM_APP_PASSWORD,
+    }
+    r = requests.post(url, data=data, timeout=30)
     r.raise_for_status()
-    return r.json()["access_token"]
+    payload = r.json()
+    token = payload.get("access_token")
+    if not token:
+        raise RuntimeError(f"Failed to obtain access_token. Response: {payload}")
+    return token
 
-# =========================
-# DATE LOGIC
-# =========================
-def next_post_datetime(now_local: datetime) -> datetime:
-    for add_days in range(0, 8):
-        d = now_local + timedelta(days=add_days)
-        candidate = d.replace(
-            hour=POST_HOUR, minute=POST_MINUTE, second=0, microsecond=0
-        )
-        if d.weekday() in THEMES and candidate > now_local:
-            return candidate
-    raise RuntimeError("Could not determine next post date")
 
-def already_scheduled(token: str, target_day: date) -> bool:
-    site = os.environ["WPCOM_SITE_ID"]
-    r = requests.get(
-        f"https://public-api.wordpress.com/rest/v1.1/sites/{site}/posts/",
-        headers={"Authorization": f"Bearer {token}"},
-        params={"status": "future", "number": 50},
-        timeout=30,
-    )
+def wpcom_create_post(token: str, post: GeneratedPost, publish_dt_local: datetime) -> dict:
+    """
+    Create post on WP.com site.
+    """
+    if not WPCOM_SITE_ID:
+        raise RuntimeError("Missing WPCOM_SITE_ID env var.")
+
+    url = f"https://public-api.wordpress.com/rest/v1.1/sites/{WPCOM_SITE_ID}/posts/new"
+    headers = {"Authorization": f"Bearer {token}"}
+
+    # Decide post status + date
+    status = "publish"
+    iso_date = None
+
+    if POST_MODE == "future":
+        status = "future"
+        # schedule a few minutes in the future
+        future_local = datetime.now(TZ) + timedelta(minutes=FUTURE_MINUTES)
+        iso_date = future_local.isoformat()
+    else:
+        # publish now (at workflow time)
+        status = "publish"
+        iso_date = None
+
+    payload = {
+        "title": post.title,
+        "content": post.html,
+        "excerpt": post.excerpt,
+        "status": status,
+        "categories": post.category,
+    }
+    if iso_date:
+        payload["date"] = iso_date
+
+    r = requests.post(url, headers=headers, data=payload, timeout=30)
     r.raise_for_status()
-    for post in r.json().get("posts", []):
-        if (post.get("date") or "").startswith(target_day.isoformat()):
-            return True
-    return False
+    return r.json()
+
 
 # =========================
-# AI POST GENERATION
+# CONTENT LOGIC
 # =========================
-def rotating_cta_style(publish_dt: datetime) -> str:
-    # 0 soft, 1 direct, 2 soft... deterministic rotation without saving state
-    return ["soft", "direct", "soft", "direct"][publish_dt.weekday() % 4]
-def friday_rotation_type(publish_dt):
+
+def friday_rotation_type(publish_dt_local: datetime) -> str:
     """
     Rotates Fuck It Friday types:
     Week 1 = A (Low-Effort Dinner Wins)
     Week 2 = B (Parenting Permission Slips)
     Week 3 = C (Hot Takes)
     """
-    week_number = publish_dt.isocalendar()[1]
+    week_number = publish_dt_local.isocalendar()[1]
     return ["A", "B", "C"][(week_number - 1) % 3]
 
-def build_prompt(theme, publish_dt):
-    weekday = publish_dt.weekday()
-    cta_style = rotating_cta_style(publish_dt)
+
+def pick_theme_for_today(now_local: datetime) -> dict | None:
+    """
+    Returns a dict describing what to generate today (Mon/Wed/Fri/Sun),
+    or None if today is not a post day.
+    """
+    weekday = now_local.weekday()  # Mon=0 ... Sun=6
+
+    if weekday == 0:
+        return {"key": "mom_chaos_monday", "label": "Mom Chaos Monday", "category": CATEGORY_MOM_CHAOS}
+    if weekday == 2:
+        return {"key": "wtfs_wednesday", "label": "WTF’s for Dinner Wednesday", "category": CATEGORY_WTFS}
+    if weekday == 4:
+        return {"key": "fuck_it_friday", "label": "Fuck It Friday", "category": CATEGORY_FIF}
+    if weekday == 6:
+        return {"key": "feed_the_chaos_sunday", "label": "Feed the Chaos Sunday Drop", "category": CATEGORY_SUNDAY}
+
+    return None
+
+
+def build_prompt(theme: dict, publish_dt_local: datetime) -> str:
     stan_link = STAN_URL if STAN_URL else "[STAN STORE LINK]"
 
     base_voice = """
+You are writing as PottyMouthPanda.
+
 VOICE RULES:
-- Profanity is normal and on-brand (fuck, shit, ass allowed)
-- Do NOT swear every sentence
-- Conversational, honest, slightly unhinged
-- No corporate tone
-- No therapy-speak
-- No alcohol references
-- No inspirational poster bullshit
-- No repeating frameworks unless explicitly told
+- Profanity is normal and on-brand (fuck, shit, ass allowed).
+- Do NOT swear every sentence.
+- Conversational, honest, slightly unhinged, and funny when it fits.
+- No corporate tone. No therapy-speak. No inspirational poster bullshit.
+- No alcohol/wine references.
+- Never mention being an AI or model.
+
+STYLE RULES:
+- Short paragraphs, skimmable, readable.
+- Use H2 headers where useful.
+- Avoid repeating the same framework phrases post-to-post.
 """
 
-    if weekday == 0:
-        prompt = f"""
-Write a Mom Chaos Monday blog post in the PottyMouthPanda voice.
+    key = theme["key"]
 
+    if key == "mom_chaos_monday":
+        return f"""
 {base_voice}
 
-POST RULES:
-- Focus on ONE specific, real parenting moment
-- Mental load, burnout, schedules, chaos
-- NO recipes
-- NO meal plans
-- Include ONE practical takeaway or mindset shift at the end
+Write a Mom Chaos Monday blog post.
+
+REQUIREMENTS:
+- Center on ONE specific, relatable parenting moment/story (real-life chaos, mental load, burnout, schedules, kids).
+- NO recipes.
+- NO meal plan.
+- Include ONE practical tip, trick, or mindset shift at the end.
 
 STRUCTURE:
-1. Short real-life story
-2. Why it was frustrating or overwhelming
-3. One realistic tip or reframe
-4. Gentle close
+1) Hook + story (real, specific)
+2) Why it hit so hard / what made it chaotic
+3) The “here’s what actually helped” tip
+4) Gentle close (no hard sell)
 
 CTA:
 - Optional
 - One sentence max
-- Soft mention only
+- Soft mention only, like: “This is why I simplify meals so hard.”
 
 LENGTH:
 700–1000 words
 
-GOAL:
-Make the reader feel less alone.
+OUTPUT FORMAT (STRICT):
+Return VALID JSON ONLY with keys: title, excerpt (<=160 chars), html
 """
 
-    elif weekday == 2:
-        prompt = f"""
-Write a WTF’s for Dinner Wednesday blog post in the PottyMouthPanda voice.
-
+    if key == "wtfs_wednesday":
+        return f"""
 {base_voice}
 
-POST RULES:
-- Feature ONE new family- and budget-friendly recipe
-- Weeknight realistic
-- FULL ingredients and instructions required
-- Include optional swaps for picky eaters or budget needs
+Write a WTF’s for Dinner Wednesday blog post.
 
-STRUCTURE:
-1. Why this recipe exists
-2. Ingredients list
-3. Step-by-step instructions
-4. Optional swaps or shortcuts
-5. Why this recipe works
+REQUIREMENTS:
+- Feature ONE new family- and budget-friendly recipe.
+- Weeknight realistic.
+- Include FULL ingredients and step-by-step instructions.
+- Include optional swaps for picky eaters and budget constraints.
 
 HARD RULES:
-- NO frameworks
-- NO weekly plans
-- NO long storytelling
+- NO weekly plan.
+- NO long storytelling.
+- NO “framework” post.
+
+STRUCTURE:
+1) Hook + why this recipe exists
+2) Ingredients
+3) Instructions
+4) Swaps/shortcuts
+5) Why it works + quick close
 
 CTA:
-Soft CTA only (one sentence)
+- Soft (one sentence) and optional:
+  “This is the kind of recipe I build my weekly plans around.”
 
 LENGTH:
 600–900 words
 
-GOAL:
-Reader thinks “I could actually make this.”
+OUTPUT FORMAT (STRICT):
+Return VALID JSON ONLY with keys: title, excerpt (<=160 chars), html
 """
 
-    elif weekday == 4:
-        fit_type = friday_rotation_type(publish_dt)
-
-        prompt = f"""
-Write a Fuck It Friday blog post in the PottyMouthPanda voice.
-
+    if key == "fuck_it_friday":
+        fit_type = friday_rotation_type(publish_dt_local)
+        return f"""
 {base_voice}
+
+Write a Fuck It Friday blog post.
 
 THIS WEEK’S TYPE: {fit_type}
 
 TYPE RULES:
 A = Low-Effort Dinner Wins
+- Frozen food, snack plates, breakfast for dinner, shortcuts that count.
+- Normalize “bare minimum” as smart.
+
 B = Parenting Permission Slips
-C = Hot Takes
+- Dismantle guilt. Validate tired parents.
+- No fixing. Just permission and relief.
+
+C = Hot Takes (safe)
+- Call out harmful expectations or narratives.
+- Focus on systems/culture, not attacking individuals.
+- Grounded, not mean.
 
 STRUCTURE:
-1. Strong opening opinion
-2. Normalize the shortcut or belief
-3. Reframe guilt or expectations
-4. Calm, relieving close
+1) Strong opening opinion
+2) Normalize the shortcut/belief
+3) Reframe guilt/expectations
+4) Calm, relieving close
 
 CTA:
-Optional, never salesy
+- Optional
+- Never salesy
 
 LENGTH:
 700–1000 words
 
-GOAL:
-Make readers exhale.
+OUTPUT FORMAT (STRICT):
+Return VALID JSON ONLY with keys: title, excerpt (<=160 chars), html
 """
 
-    elif weekday == 6:
-        prompt = f"""
-Write a Feed the Chaos Sunday Drop blog post in the PottyMouthPanda voice.
-
+    if key == "feed_the_chaos_sunday":
+        return f"""
 {base_voice}
 
-POST RULES:
-- Weekly meal plan OVERVIEW ONLY
-- NO recipes
-- NO teaching
-- NO storytelling
+Write a Feed the Chaos Sunday Drop blog post.
+
+PURPOSE:
+- Weekly meal plan OVERVIEW only.
+- Do NOT include full recipes.
+- Do NOT teach a framework.
+- Keep it skimmable and confident.
 
 REQUIRED CONTENT:
 - 3 breakfast options
@@ -241,105 +298,122 @@ REQUIRED CONTENT:
 - 6 dinners
 
 STRUCTURE:
-1. Short relief-focused opening
-2. Breakfast list
-3. Lunch list
-4. Snack list
-5. Dinner list
-6. Value explanation
-7. Direct CTA
+1) Short relief-focused opening
+2) Breakfast list
+3) Lunch list
+4) Snack list
+5) Dinner list
+6) 3–5 bullet “why this plan works”
+7) Direct CTA
 
-CTA:
+CTA (DIRECT):
 “This is the overview. The full plan lives inside Feed the Chaos.”
-Link: {stan_link}
+Include the link: {stan_link}
 
 LENGTH:
 600–800 words
 
-GOAL:
-Make the paid plan feel obvious.
+OUTPUT FORMAT (STRICT):
+Return VALID JSON ONLY with keys: title, excerpt (<=160 chars), html
 """
 
-    else:
-        raise ValueError("No prompt defined for this weekday")
+    raise ValueError("Unknown theme key")
 
-    return prompt
-
-
-def ai_generate_post(theme: dict, publish_dt: datetime) -> dict:
-    client = OpenAI()
-
-    prompt = build_prompt(theme, publish_dt)
-
-    # Responses API (recommended) :contentReference[oaicite:2]{index=2}
-    resp = client.responses.create(
-        model="gpt-5.2",
-        input=prompt,
-        text={"verbosity": "low"},
-    )
-
-    raw = resp.output_text.strip()
-
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        # fallback: try to extract JSON if the model accidentally wrapped it
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1:
-            raise RuntimeError(f"Model did not return JSON. Output was:\n{raw[:800]}")
-        data = json.loads(raw[start : end + 1])
-
-    for k in ["title", "excerpt", "html"]:
-        if k not in data or not isinstance(data[k], str) or not data[k].strip():
-            raise RuntimeError(f"Missing/invalid '{k}' in model JSON.")
-
-    # Build the final post payload
-    return {
-        "title": data["title"].strip(),
-        "content": data["html"].strip(),
-        "excerpt": data["excerpt"].strip(),
-        "categories": [theme["category"]],
-        "tags": theme["tags"],
-    }
 
 # =========================
-# SCHEDULE WORDPRESS POST
+# OPENAI GENERATION
 # =========================
-def schedule_post(token: str, post: dict, publish_dt: datetime):
-    site = os.environ["WPCOM_SITE_ID"]
-    r = requests.post(
-        f"https://public-api.wordpress.com/rest/v1.1/sites/{site}/posts/new",
-        headers={"Authorization": f"Bearer {token}"},
-        data={
-            "title": post["title"],
-            "content": post["content"],
-            "excerpt": post["excerpt"],
-            "status": "future",
-            "date": publish_dt.isoformat(),
-            "categories": post["categories"],
-            "tags": post["tags"],
-        },
-        timeout=30,
-    )
-    r.raise_for_status()
-    return r.json()
+
+def extract_json_from_response(text: str) -> dict:
+    """
+    Attempts to extract a JSON object from model output.
+    """
+    text = text.strip()
+
+    # If it's already pure JSON
+    if text.startswith("{") and text.endswith("}"):
+        return json.loads(text)
+
+    # Try to find first JSON object in text
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not m:
+        raise ValueError("No JSON object found in model output.")
+    return json.loads(m.group(0))
+
+
+def ai_generate_post(theme: dict, publish_dt_local: datetime) -> GeneratedPost:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Missing OPENAI_API_KEY env var.")
+
+    prompt = build_prompt(theme, publish_dt_local)
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # Retry a couple times if the model returns invalid JSON
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            resp = client.responses.create(
+                model=OPENAI_MODEL,
+                input=prompt,
+            )
+            # Responses API returns text in output_text
+            text = resp.output_text
+            data = extract_json_from_response(text)
+
+            title = (data.get("title") or "").strip()
+            excerpt = (data.get("excerpt") or "").strip()
+            html = (data.get("html") or "").strip()
+
+            if not title or not html:
+                raise ValueError("JSON missing required fields (title/html).")
+
+            # Add a very light CTA link safety if Stan URL exists and Sunday post forgets it
+            # (We don't force links on other days.)
+            if theme["key"] == "feed_the_chaos_sunday" and STAN_URL and STAN_URL not in html:
+                html += f'<p><a href="{STAN_URL}">Grab this week’s full Feed the Chaos plan here.</a></p>'
+
+            return GeneratedPost(
+                title=title,
+                excerpt=excerpt[:160],
+                html=html,
+                category=theme["category"],
+            )
+
+        except Exception as e:
+            last_err = e
+            print(f"AI generation attempt {attempt} failed: {e}")
+            time.sleep(1.5)
+
+    raise RuntimeError(f"AI generation failed after retries: {last_err}")
+
 
 # =========================
 # MAIN
 # =========================
+
+def main():
+    now_local = datetime.now(TZ)
+    theme = pick_theme_for_today(now_local)
+
+    # ✅ Clean exit on non-post days (no more red X)
+    if theme is None:
+        print(f"Not a scheduled post day in {TZ_NAME}. Exiting cleanly.")
+        return 0
+
+    publish_dt_local = now_local  # publish at run time; set POST_MODE=future to schedule ahead
+
+    print(f"Generating: {theme['label']} | Category: {theme['category']} | Local time: {now_local.isoformat()}")
+    post = ai_generate_post(theme, publish_dt_local)
+
+    token = wpcom_get_token()
+    created = wpcom_create_post(token, post, publish_dt_local)
+
+    print("✅ Post created.")
+    print("Title:", created.get("title"))
+    print("URL:", created.get("URL") or created.get("url"))
+    return 0
+
+
 if __name__ == "__main__":
-    tz = ZoneInfo(TIMEZONE)
-    now = datetime.now(tz)
-
-    wp_token = get_wp_token()
-    publish_dt = next_post_datetime(now)
-    theme = THEMES[publish_dt.weekday()]
-
-    if already_scheduled(wp_token, publish_dt.date()):
-        print("Post already scheduled for", publish_dt.date())
-        raise SystemExit(0)
-
-    post = ai_generate_post(theme, publish_dt)
-    created = schedule_post(wp_token, post, publish_dt)
-    print("Scheduled:", created.get("URL"))
+    raise SystemExit(main())
